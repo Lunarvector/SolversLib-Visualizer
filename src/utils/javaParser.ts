@@ -63,81 +63,120 @@ export function parseJavaCode(javaCode: string): { startPoint: Point; lines: Lin
 function parseSplineSegments(javaCode: string): SplineSegment[] {
   const segments: SplineSegment[] = [];
 
-  // Pattern to match new Pose2d(...) with both Math.toRadians() and direct radians
-  const pose2dPattern = /new\s+Pose2d\s*\(\s*([-+]?\d+\.?\d*)\s*,\s*([-+]?\d+\.?\d*)\s*,\s*(?:Math\.toRadians\s*\(\s*)?([-+]?\d+\.?\d*)\s*\)?\s*\)/g;
+  const extractPose2dFromString = (str: string): Pose2dData | null => {
+    const match = /new\s+Pose2d\s*\(\s*([-+]?\d+(?:\.\d+)?)\s*,\s*([-+]?\d+(?:\.\d+)?)\s*,\s*(?:Math\.toRadians\s*\(\s*)?([-+]?\d+(?:\.\d+)?)\s*\)?\s*\)/.exec(str);
+    if (!match) return null;
 
-  // Find all spline method calls (linearTo, tangentialTo, splineTo)
-  const splineCallPattern = /\.(linearTo|tangentialTo|splineTo)\s*\(\s*new\s+Pose2d\s*\(\s*([-+]?\d+\.?\d*)\s*,\s*([-+]?\d+\.?\d*)\s*,\s*(?:Math\.toRadians\s*\(\s*)?([-+]?\d+\.?\d*)\s*\)?\s*\)\s*\)/g;
+    let heading = parseFloat(match[3]);
+    if (str.substring(match.index, match.index + match[0].length).includes('Math.toRadians')) {
+      heading = degreesToRadians(heading);
+    }
 
-  const splineCalls: Array<{ type: string; pose: Pose2dData; index: number; hasToRadians: boolean }> = [];
-  let match;
+    return {
+      x: parseFloat(match[1]),
+      y: parseFloat(match[2]),
+      heading: heading
+    };
+  };
 
-  while ((match = splineCallPattern.exec(javaCode)) !== null) {
-    const hasToRadians = match[0].includes('Math.toRadians');
-    splineCalls.push({
-      type: match[1],
-      pose: {
-        x: parseFloat(match[2]),
-        y: parseFloat(match[3]),
-        heading: hasToRadians ? parseFloat(match[4]) : parseFloat(match[4]) * Math.PI / 180
-      },
-      index: match.index,
-      hasToRadians: hasToRadians
-    });
-  }
-
-  // If spline calls found, use them to build segments
-  if (splineCalls.length > 0) {
-    // Find the starting pose (first Pose2d that's not in a spline call)
-    const firstCallIndex = splineCalls[0].index;
-    const beforeFirstCall = javaCode.substring(0, firstCallIndex);
-
-    pose2dPattern.lastIndex = 0;
-    const startMatch = pose2dPattern.exec(beforeFirstCall);
-
-    if (startMatch) {
-      const hasToRadians = startMatch[0].includes('Math.toRadians');
-      const startPose: Pose2dData = {
-        x: parseFloat(startMatch[1]),
-        y: parseFloat(startMatch[2]),
-        heading: hasToRadians ? parseFloat(startMatch[3]) : parseFloat(startMatch[3]) * Math.PI / 180
-      };
-
-      for (let i = 0; i < splineCalls.length; i++) {
-        const currentStart = i === 0 ? startPose : splineCalls[i - 1].pose;
-        const call = splineCalls[i];
-
-        segments.push({
-          type: call.type === "linearTo" ? "linear" : "tangential",
-          start: currentStart,
-          end: call.pose,
-          controlPoints: []
-        });
+  const getAllPose2ds = (str: string): Pose2dData[] => {
+    const poses: Pose2dData[] = [];
+    const pattern = /new\s+Pose2d\s*\(\s*([-+]?\d+(?:\.\d+)?)\s*,\s*([-+]?\d+(?:\.\d+)?)\s*,\s*(?:Math\.toRadians\s*\(\s*)?([-+]?\d+(?:\.\d+)?)\s*\)?\s*\)/g;
+    let match;
+    while ((match = pattern.exec(str)) !== null) {
+      let heading = parseFloat(match[3]);
+      if (str.substring(match.index, match.index + match[0].length).includes('Math.toRadians')) {
+        heading = degreesToRadians(heading);
       }
+      poses.push({
+        x: parseFloat(match[1]),
+        y: parseFloat(match[2]),
+        heading: heading
+      });
+    }
+    return poses;
+  };
 
-      return segments;
+  const linearMatches: Array<{ str: string; index: number }> = [];
+  const tangentialMatches: Array<{ str: string; index: number }> = [];
+
+  const linearRegex = /new\s+LinearSpline\s*\([^]*?\)/;
+  const tangentialRegex = /new\s+TangentialSpline\s*\([^]*?\)/;
+
+  let linearIndex = 0;
+  let tangentialIndex = 0;
+
+  for (let i = 0; i < javaCode.length; i++) {
+    if (javaCode.substring(i).startsWith('new LinearSpline')) {
+      let depth = 0;
+      let start = i;
+      let found = false;
+      for (let j = i; j < javaCode.length; j++) {
+        if (javaCode[j] === '(') depth++;
+        if (javaCode[j] === ')') {
+          depth--;
+          if (depth === 0) {
+            linearMatches.push({
+              str: javaCode.substring(start, j + 1),
+              index: start
+            });
+            found = true;
+            break;
+          }
+        }
+      }
+      if (found) i += 20;
+    }
+
+    if (javaCode.substring(i).startsWith('new TangentialSpline')) {
+      let depth = 0;
+      let start = i;
+      let found = false;
+      for (let j = i; j < javaCode.length; j++) {
+        if (javaCode[j] === '(') depth++;
+        if (javaCode[j] === ')') {
+          depth--;
+          if (depth === 0) {
+            tangentialMatches.push({
+              str: javaCode.substring(start, j + 1),
+              index: start
+            });
+            found = true;
+            break;
+          }
+        }
+      }
+      if (found) i += 23;
     }
   }
 
-  // Fallback: Find all Pose2d objects and create linear segments
-  const poses: Pose2dData[] = [];
-  pose2dPattern.lastIndex = 0;
+  const allMatches = [
+    ...linearMatches.map(m => ({ ...m, type: 'linear' as const })),
+    ...tangentialMatches.map(m => ({ ...m, type: 'tangential' as const }))
+  ].sort((a, b) => a.index - b.index);
 
-  while ((match = pose2dPattern.exec(javaCode)) !== null) {
-    const hasToRadians = match[0].includes('Math.toRadians');
-    poses.push({
-      x: parseFloat(match[1]),
-      y: parseFloat(match[2]),
-      heading: hasToRadians ? parseFloat(match[3]) : parseFloat(match[3]) * Math.PI / 180
-    });
+  if (allMatches.length > 0) {
+    for (const match of allMatches) {
+      const poses = getAllPose2ds(match.str);
+      if (poses.length === 2) {
+        segments.push({
+          type: match.type,
+          start: poses[0],
+          end: poses[1],
+          controlPoints: []
+        });
+      }
+    }
+    return segments;
   }
 
-  if (poses.length >= 2) {
-    for (let i = 1; i < poses.length; i++) {
+  const allPoses = getAllPose2ds(javaCode);
+  if (allPoses.length >= 2) {
+    for (let i = 1; i < allPoses.length; i++) {
       segments.push({
         type: "linear",
-        start: poses[i - 1],
-        end: poses[i],
+        start: allPoses[i - 1],
+        end: allPoses[i],
         controlPoints: []
       });
     }
@@ -151,15 +190,12 @@ function generateQuinticControlPoints(segment: SplineSegment): { x: number; y: n
     return [];
   }
 
-  // For tangential splines, generate control points based on quintic Hermite
-  // matching the TangentialSpline.java implementation
   const p0 = { x: segment.start.x, y: segment.start.y };
   const p1 = { x: segment.end.x, y: segment.end.y };
 
   const dist = Math.hypot(p1.x - p0.x, p1.y - p0.y);
   const scale = dist * 1.2;
 
-  // Velocity vectors based on heading angles (in radians)
   const v0 = {
     x: Math.cos(segment.start.heading) * scale,
     y: Math.sin(segment.start.heading) * scale
@@ -170,17 +206,6 @@ function generateQuinticControlPoints(segment: SplineSegment): { x: number; y: n
     y: Math.sin(segment.end.heading) * scale
   };
 
-  // Sample the quintic Hermite curve at multiple points to approximate with cubic Bezier
-  // The quintic uses these coefficients:
-  // c5 = p0*(-6) - v0*(3) + p1*(6) - v1*(3)
-  // c4 = p0*(15) + v0*(8) - p1*(15) + v1*(7)
-  // c3 = p0*(-10) - v0*(6) + p1*(10) - v1*(4)
-  // c2 = 0
-  // c1 = v0
-  // c0 = p0
-
-  // For better approximation, we'll fit cubic Bezier control points
-  // by sampling the quintic at t=1/3 and t=2/3
   const samples = 50;
   const points: { x: number; y: number }[] = [];
 
@@ -204,8 +229,6 @@ function generateQuinticControlPoints(segment: SplineSegment): { x: number; y: n
     points.push({ x: px, y: py });
   }
 
-  // Fit cubic Bezier by using velocity-based control points with better scaling
-  // This approximation works well for visualization purposes
   const cp1 = {
     x: p0.x + v0.x * 0.25,
     y: p0.y + v0.y * 0.25
@@ -221,6 +244,10 @@ function generateQuinticControlPoints(segment: SplineSegment): { x: number; y: n
 
 function radiansToDegrees(radians: number): number {
   return (radians * 180) / Math.PI;
+}
+
+function degreesToRadians(degrees: number): number {
+  return (degrees * Math.PI) / 180;
 }
 
 function getRandomColor() {
